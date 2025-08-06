@@ -93,7 +93,7 @@ def skill_score(rmse_model: float, rmse_naive: float) -> float:
 def arimax_forecaster(y_train: np.ndarray,
                       X_train: np.ndarray,
                       X_test: np.ndarray,
-                      horizon: int = 3) -> np.ndarray:
+                      horizon: int = 15) -> np.ndarray:
     """
     Default model: non-seasonal ARIMAX via pmdarima.auto_arima.
     Returns array of length `horizon`.
@@ -113,19 +113,19 @@ def arimax_forecaster(y_train: np.ndarray,
 def evaluate_once(station_df: pd.DataFrame,
                   valid_years: list[int],
                   model_fn=arimax_forecaster,
-                  horizon: int = 3) -> dict[str, float] | None:
+                  horizon: int = 15) -> dict[str, float] | None:
     """
-    • Randomly chooses a 90-day training + 3-day test window within one valid year.
-    • Fits `model_fn`, predicts 3 steps, and computes MAE, RMSE, MASE & Skill.
+    • Randomly chooses a 180-day training + 15-day test window within one valid year.
+    • Fits `model_fn`, predicts 15 steps, and computes MAE, RMSE, MASE & Skill.
     """
     year = random.choice(valid_years)
     df_year = station_df[station_df['YEAR'] == year].reset_index(drop=True)
-    if len(df_year) < (90 + horizon):
+    if len(df_year) < (180 + horizon):
         return None
 
-    start = random.randint(0, len(df_year) - (90 + horizon))
-    train = df_year.iloc[start:start + 90]
-    test  = df_year.iloc[start + 90: start + 90 + horizon]
+    start = random.randint(0, len(df_year) - (180 + horizon))
+    train = df_year.iloc[start:start + 180]
+    test  = df_year.iloc[start + 180: start + 180 + horizon]
 
     y_train, y_test = train["TEMP"].values, test["TEMP"].values
     exog_cols = [c for c in station_df.columns if c != "TEMP"]
@@ -162,9 +162,9 @@ def main(args: argparse.Namespace) -> None:
         df = prepare_station_data(sid, args.base_dir)
         if df is None or df.empty:
             continue
-        # valid yrs must have ≥90+3 days
+        # valid yrs must have 180+15 days
         counts = df.groupby("YEAR").size()
-        valid  = [y for y, n in counts.items() if 2000 <= y <= 2024 and n >= 93]
+        valid  = [y for y, n in counts.items() if 2000 <= y <= 2024 and n >= 180 +15]
         if not valid:
             continue
         station_data[sid]  = df
@@ -218,180 +218,3 @@ if __name__ == "__main__":
     args = p.parse_args()
     main(args)
 
-
-
-'''#!/usr/bin/env python3
-"""
-ARIMA-based baseline for station temperature forecasting
-Uses auto_arima on 25 years of daily data, then evaluates on random 30-day samples from years 2000 to 2024
-"""
-import os
-import glob
-import random
-import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-import numpy as np
-import pandas as pd
-from tqdm import tqdm
-import pmdarima as pm
-from sklearn.metrics import mean_absolute_error, mean_squared_error
-
-import warnings
-warnings.filterwarnings('ignore')  # suppress pmdarima warnings
-
-
-def prepare_station_data(station_id, base_dir='NOAA_GSOD'):
-    """
-    Load and preprocess GSOD station data for a given station_id.
-    Drops features with >20% missing, returns DataFrame of features + TEMP.
-    """
-    pattern = os.path.join(base_dir, '*', f'{station_id}.csv')
-    files = glob.glob(pattern)
-    if not files:
-        print(f"Warning: no files for station {station_id}")
-        return None
-
-    dfs = []
-    for fp in files:
-        df = pd.read_csv(fp, parse_dates=['DATE'])
-        dfs.append(df)
-    station_df = pd.concat(dfs).sort_values('DATE').reset_index(drop=True)
-
-    # clean numeric
-    num_cols = ['TEMP', 'DEWP', 'SLP', 'STP', 'VISIB', 'WDSP', 'PRCP']
-    for col in num_cols:
-        station_df[col] = (
-            station_df[col].astype(str)
-            .str.strip()
-            .replace({'9999.9': np.nan, '999.9': np.nan, '99.99': np.nan, '': np.nan})
-            .astype(float)
-        )
-
-    # calendar features & lag
-    station_df['YEAR'] = station_df['DATE'].dt.year
-    station_df['MONTH'] = station_df['DATE'].dt.month
-    station_df['DAY_OF_YEAR'] = station_df['DATE'].dt.dayofyear
-    station_df['WEEK_OF_YEAR'] = station_df['DATE'].dt.isocalendar().week
-    station_df['TEMP_LAG1'] = station_df['TEMP'].shift(1)
-
-    # drop rows without target
-    station_df = station_df.dropna(subset=['TEMP'])
-
-    # initial feature list
-    features = ['DEWP', 'SLP', 'STP', 'VISIB', 'WDSP', 'PRCP',
-                'YEAR', 'MONTH', 'DAY_OF_YEAR', 'WEEK_OF_YEAR', 'TEMP_LAG1']
-
-    # drop columns with >20% missing
-    na_frac = station_df[features].isna().mean()
-    keep = na_frac[na_frac <= 0.2].index.tolist()
-    df_final = station_df[keep + ['TEMP']].dropna()
-    return df_final
-
-
-def load_station_list(txt_path):
-    with open(txt_path) as f:
-        return [l.strip() for l in f if l.strip()]
-
-
-def evaluate_single(station_id, df_all_years, valid_years):
-    """
-    Train-auto_arima evaluation for a random 90-day block from a random valid year.
-    """
-    # pick a year that has at least 93 days of data
-    year = random.choice(valid_years)
-    df_year = df_all_years[df_all_years['YEAR'] == year].reset_index(drop=True)
-
-    # pick contiguous 90-day training window + 3-day test
-    start = random.randint(0, len(df_year) - 93)
-    train = df_year.iloc[start:start+90]
-    test = df_year.iloc[start+90:start+93]
-
-    y_train = train['TEMP'].values
-    y_test = test['TEMP'].values
-    exog_cols = [c for c in df_year.columns if c != 'TEMP']
-    X_train = train[exog_cols].values
-    X_test = test[exog_cols].values
-
-    model = pm.auto_arima(
-        y_train,
-        exogenous=X_train,
-        seasonal=False,
-        stepwise=True,
-        suppress_warnings=True,
-        error_action='ignore'
-    )
-
-    y_pred = model.predict(n_periods=3, exogenous=X_test)
-
-    mae = mean_absolute_error(y_test, y_pred)
-    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-    return mae, rmse
-
-
-def main(args):
-    stations = load_station_list(args.station_list)
-
-    print("Preprocessing station data for years 2000-2024...")
-    station_data = {}
-    station_years = {}
-    for station in stations:
-        df = prepare_station_data(station, args.base_dir)
-        if df is None or df.empty:
-            continue
-        # identify years with sufficient data
-        grouped = df.groupby('YEAR')
-        valid = [y for y, grp in grouped if 2000 <= y <= 2024 and len(grp) >= 93]
-        if not valid:
-            continue
-        station_data[station] = df
-        station_years[station] = valid
-
-    if not station_data:
-        print("No stations with valid data between 2000 and 2024. Exiting.")
-        return
-
-    print(f"Prepared data for {len(station_data)} stations.")
-
-    # multithreaded evaluation
-    results = []
-    with ThreadPoolExecutor(max_workers=args.workers) as exe:
-        futures = []
-        for _ in range(args.iterations):
-            station = random.choice(list(station_data.keys()))
-            futures.append(
-                exe.submit(
-                    evaluate_single,
-                    station,
-                    station_data[station],
-                    station_years[station]
-                )
-            )
-
-        for f in tqdm(as_completed(futures), total=len(futures), desc="Evaluations"):
-            try:
-                results.append(f.result())
-            except Exception:
-                continue
-
-    if results:
-        maes, rmses = zip(*results)
-        print(f"Successful iterations: {len(results)}")
-        print(f"Average MAE: {np.mean(maes):.3f}")
-        print(f"Average RMSE: {np.mean(rmses):.3f}")
-    else:
-        print("No successful iterations completed.")
-
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="ARIMA-based baseline forecasting")
-    parser.add_argument('--base-dir', default='NOAA_GSOD', help='Base directory for GSOD data')
-    parser.add_argument('--station-list', default='listToTrain.txt', help='Path to station list')
-    parser.add_argument('--iterations', type=int, default=1000, help='Number of random trials')
-    parser.add_argument('--workers', type=int, default=16, help='Number of threads to use')
-    args = parser.parse_args()
-    main(args)
-
-
-
-'''
