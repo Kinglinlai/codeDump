@@ -76,4 +76,5 @@ def download_station_data():
     print(f"\nData location: NOAA_GSOD/{{YEAR}}/{station_file}")
 
 if __name__ == "__main__":
-    download_station_data()
+    while True:
+        download_station_data()
