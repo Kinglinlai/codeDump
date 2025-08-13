@@ -11,9 +11,6 @@ FEATURE_COLUMNS = [
     "STP",
     "VISIB",
     "WDSP",
-    "MXSPD",
-    "MAX",
-    "MIN",
     "PRCP",
 ]
 
@@ -55,6 +52,17 @@ def main():
     print("First 20 COMPLETE stations reporting all requested features:")
     for station in stations[:20]:
         print(station)
+    
+    # Save all marked stations to a file
+    output_file = 'ac_stations.txt'
+    try:
+        with open(output_file, 'w') as f:
+            for station_id in stations:
+                f.write(f"{station_id}\n")
+        print(f"\nSaved all {len(stations)} stations to {output_file}")
+    except IOError as e:
+        print(f"Error: Could not write to file {output_file}. Reason: {e}", file=sys.stderr)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

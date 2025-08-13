@@ -10,7 +10,7 @@ YEARS = list(range(2000, 2025))  # 2000 to 2024 inclusive
 MIN_YEARS = len(YEARS)  # 25 years
 
 # Pattern to detect placeholder missing values like '9999.9', '999.9', '99.9', etc.
-PLACEHOLDER_RE = re.compile(r'^9+(\.9+)?$')
+PLACEHOLDER_RE = ['99999.9''9999.9','999.9','99.9']
 
 def get_measured_features(file_path):
     """
@@ -26,9 +26,9 @@ def get_measured_features(file_path):
     for col_idx in range(2, len(header)):
         ph_count = sum(
             1 for row in sample_rows
-            if PLACEHOLDER_RE.match(row[col_idx].strip())
+            if (row[col_idx].strip()) in PLACEHOLDER_RE
         )
-        if ph_count <= 2:
+        if ph_count <= 4:
             measured.add(header[col_idx])
     return measured
 
@@ -107,19 +107,19 @@ def check_station_coverage():
     print(f"Stations with complete data ({MIN_YEARS} years): {len(complete_stations)}")
     print(f"Stations with incomplete data: {len(missing_data)}")
 
-    if complete_stations:
-        print("\nStations with complete coverage (2000–2024):")
-        for st in complete_stations:
-            print(f"- {st}")
-    else:
-        print("\nNo stations have complete coverage for all years.")
+    #if complete_stations:
+        #print("\nStations with complete coverage (2000–2024):")
+        #for st in complete_stations:
+            #print(f"- {st}")
+    #else:
+        #print("\nNo stations have complete coverage for all years.")
 
-    if missing_data:
-        print("\nTop 5 stations with most missing years:")
-        top5 = sorted(missing_data.items(), key=lambda x: len(x[1]), reverse=True)[:5]
-        for st, years in top5:
-            preview = years[:3] + (['...'] if len(years) > 3 else [])
-            print(f"- {st}: Missing {len(years)} years (e.g. {preview})")
+    # if missing_data:
+    #     print("\nTop 5 stations with most missing years:")
+    #     top5 = sorted(missing_data.items(), key=lambda x: len(x[1]), reverse=True)[:5]
+    #     for st, years in top5:
+    #         preview = years[:3] + (['...'] if len(years) > 3 else [])
+    #         print(f"- {st}: Missing {len(years)} years (e.g. {preview})")
 
 if __name__ == "__main__":
     check_station_coverage()

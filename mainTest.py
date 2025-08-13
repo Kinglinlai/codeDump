@@ -1,238 +1,299 @@
-#!/usr/bin/env python3
-"""
-Evaluate a trained weather-forecast model on unseen stations.
-
-Assumes:
-• checkpoints are in ./models and were saved by train_*.py
-• listToTest.txt contains one station ID per line
-• NOAA_GSOD directory layout is identical to training
-
-Outputs a per-feature table with MAE, RMSE and skill score.
-"""
-from __future__ import annotations
-
+# mainTest.py
 import argparse
-import math
+import os
 import sys
-from importlib import import_module
-from pathlib import Path
-from typing import Dict, List, Tuple
+import time
+import importlib
+from glob import glob
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
 import torch
-from torch import Tensor
-from torch.utils.data import DataLoader, Dataset
-from tqdm.auto import tqdm
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
 
-# --------------------------------------------------------------------------- #
-# ------------------------------ CLI ---------------------------------------- #
-# --------------------------------------------------------------------------- #
-DEF_MODEL = "weather_LSTM.pt"
-THIS_DIR = Path(__file__).resolve().parent
-MODELS_DIR = THIS_DIR / "models"
-DATA_DIR = THIS_DIR / "NOAA_GSOD"
-TEST_LIST_FILE = THIS_DIR / "listToTest.txt"
+FEATURE_COLUMNS = ["TEMP", "DEWP", "SLP", "STP", "VISIB", "WDSP", "PRCP"]
+STATIC_COLUMNS = ["MonthOfFirstForcast", "LATITUDE", "LONGITUDE", "ELEVATION"]
+YEARS = list(range(2000, 2025))
+PLACEHOLDER_STRINGS = {"9999.9", "999.9", "99.9"}
 
-def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Evaluate a GSOD weather model.")
-    p.add_argument("--model", default=DEF_MODEL,
-                   help="Checkpoint filename inside ./models/ (default: weather_LSTM.pt)")
-    p.add_argument("--batch_size", type=int, default=128)
-    p.add_argument("--device", choices=["cuda", "cpu"], default=None,
-                   help="Force device (default: auto-select)")
-    p.add_argument("--list_file", type=Path, default=TEST_LIST_FILE,
-                   help="Path to list of station IDs for evaluation")
-    return p.parse_args()
+# ============== I/O & Cleaning (mirrors mainTrain.py) ==============
 
-# --------------------------------------------------------------------------- #
-# ------------------------------ Data utils --------------------------------- #
-# --------------------------------------------------------------------------- #
-FEATURE_COLUMNS = [
-    "TEMP", "DEWP", "SLP", "STP", "VISIB",
-    "WDSP", "MXSPD", "MAX", "MIN", "PRCP",
-]
-
-INPUT_SEQ_LEN  = 90     # must match training
-OUTPUT_SEQ_LEN = 15
-
-def _load_single_csv(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path, low_memory=False)
-    keep = ["DATE", *FEATURE_COLUMNS]
-    df = df[keep].copy()
-    df[FEATURE_COLUMNS] = df[FEATURE_COLUMNS].apply(
-        lambda col: pd.to_numeric(col, errors="coerce")
-    )
-    df["DATE"] = pd.to_datetime(df["DATE"])
-    return df.sort_values("DATE").reset_index(drop=True)
-
-def _concat_station_years(data_dir: Path, sid: str) -> pd.DataFrame:
-    yearly_files = sorted(data_dir.glob(f"*/{sid}.csv"))
-    if not yearly_files:
-        print(f"⚠️  No data found for test station {sid}", file=sys.stderr)
-        return pd.DataFrame()
-    frames = [_load_single_csv(f) for f in yearly_files]
-    return pd.concat(frames, ignore_index=True)
-
-def _load_test_stations(data_dir: Path, ids: List[str]) -> pd.DataFrame:
-    frames = []
-    for sid in ids:
-        df = _concat_station_years(data_dir, sid)
-        if not df.empty:
-            df.insert(0, "STATION", sid)
-            frames.append(df)
-    if not frames:
-        raise SystemExit("❌  No test data available!")
-    return pd.concat(frames, ignore_index=True)
-
-class WeatherDataset(Dataset):
-    """Raw (un-normalised) windows for evaluation."""
-    def __init__(self, df: pd.DataFrame):
-        df = df.dropna(subset=FEATURE_COLUMNS).reset_index(drop=True)
-        feats = torch.tensor(df[FEATURE_COLUMNS].values, dtype=torch.float32)  # (N,F)
-
-        Xs, ys = [], []
-        for start in range(len(feats) - INPUT_SEQ_LEN - OUTPUT_SEQ_LEN):
-            end_x = start + INPUT_SEQ_LEN
-            end_y = end_x + OUTPUT_SEQ_LEN
-            Xs.append(feats[start:end_x].T)   # (F, 90)
-            ys.append(feats[end_x:end_y].T)   # (F, 15)
-        self.X = torch.stack(Xs)  # (N, F, 90)
-        self.y = torch.stack(ys)  # (N, F, 15)
-
-    def __len__(self) -> int:        return self.X.shape[0]
-    def __getitem__(self, idx: int) -> Tuple[Tensor, Tensor]:
-        return self.X[idx], self.y[idx]
-
-# --------------------------------------------------------------------------- #
-# --------------------- Metric aggregation helpers -------------------------- #
-# --------------------------------------------------------------------------- #
-class MetricTracker:
-    """
-    Aggregates MAE, RMSE, and Skill for specific forecast horizons.
-    horizons = [0, 6, 14]  ⇒ day-1, day-7, day-15
-    """
-    def __init__(self, num_feat: int, horizons=(0, 6, 14)) -> None:
-        self.horizons = list(horizons)
-        n_h = len(self.horizons)
-        self.abs_err   = torch.zeros((n_h, num_feat))
-        self.sq_err    = torch.zeros((n_h, num_feat))
-        self.sq_err_p  = torch.zeros((n_h, num_feat))  # persistence baseline
-        self.count     = torch.zeros(n_h, dtype=torch.long)
-
-    def update(self, y: Tensor, pred: Tensor, base: Tensor) -> None:
-        """
-        y, pred, base: (B, F, 15) tensors in *raw* units
-        """
-        B, F, _ = y.shape
-        for i_h, h in enumerate(self.horizons):
-            self.abs_err[i_h]  += (pred[:, :, h] - y[:, :, h]).abs().sum(dim=0).cpu()
-            self.sq_err[i_h]   += (pred[:, :, h] - y[:, :, h]).pow(2).sum(dim=0).cpu()
-            self.sq_err_p[i_h] += (base[:, :, h]  - y[:, :, h]).pow(2).sum(dim=0).cpu()
-            self.count[i_h]    += B
-
-    # ---------- tabular summary ---------------------------------------- #
-    def summary(self) -> pd.DataFrame:
-        mae   = self.abs_err  / self.count[:, None]
-        rmse  = torch.sqrt(self.sq_err / self.count[:, None])
-        skill = 1 - (self.sq_err / self.count[:, None]) / (self.sq_err_p / self.count[:, None])
-
-        # build tidy table
-        rows = []
-        for i_h, h in enumerate(self.horizons):
-            for feat_idx, feat in enumerate(FEATURE_COLUMNS):
-                rows.append(
-                    {
-                        "Horizon": f"Day {h+1}",
-                        "Feature": feat,
-                        "MAE":   mae[i_h, feat_idx].item(),
-                        "RMSE":  rmse[i_h, feat_idx].item(),
-                        "Skill": skill[i_h, feat_idx].item(),
-                    }
-                )
-        df = pd.DataFrame(rows).set_index(["Horizon", "Feature"])
-        return df
-
-# --------------------------------------------------------------------------- #
-# ------------------------------ Arch lookup -------------------------------- #
-# --------------------------------------------------------------------------- #
-def _get_arch_class(arch_name: str):
-    """Import correct class from train_{arch}.py."""
-    mod_name = f"train_{arch_name}"
+def _coerce_date(s):
     try:
-        mod = import_module(mod_name)
-    except ModuleNotFoundError:
-        raise SystemExit(f"❌  Cannot import architecture '{arch_name}'. "
-                         "Make sure train_{arch}.py exists.")
-    cls = getattr(mod, f"{arch_name}Forecast", None)
-    if cls is None:
-        raise SystemExit(f"❌  train_{arch_name}.py lacks {arch_name}Forecast class.")
-    return cls
+        if isinstance(s, (int, float)) and not np.isnan(s):
+            s = str(int(s))
+        s = str(s)
+        if len(s) == 8 and s.isdigit():
+            return datetime.strptime(s, "%Y%m%d").date()
+        return pd.to_datetime(s).date()
+    except Exception:
+        return pd.NaT
 
-# --------------------------------------------------------------------------- #
-# ------------------------------ Main eval ---------------------------------- #
-# --------------------------------------------------------------------------- #
-def main() -> None:
-    args = _parse_args()
+def _read_station_dataframe(root_dir, station_id):
+    dfs = []
+    for y in YEARS:
+        path = os.path.join(root_dir, f"{y}", f"{station_id}.csv")
+        if os.path.exists(path):
+            df = pd.read_csv(path, dtype=str)
+            df["__YEAR__"] = y
+            df["__STATION__"] = station_id
+            dfs.append(df)
+    if not dfs:
+        return None
+    df = pd.concat(dfs, ignore_index=True)
+    df.columns = [c.strip().upper() for c in df.columns]
 
-    ckpt_path = MODELS_DIR / args.model
-    if not ckpt_path.exists():
-        raise SystemExit(f"❌  {ckpt_path} not found.")
+    if "DATE" not in df.columns:
+        raise ValueError(f"{station_id}: missing DATE column.")
+    df["DATE"] = df["DATE"].apply(_coerce_date)
+    df = df.dropna(subset=["DATE"]).sort_values("DATE").reset_index(drop=True)
 
-    device = (
-        torch.device("cuda")
-        if (args.device != "cpu" and torch.cuda.is_available())
-        else torch.device("cpu")
-    )
+    # Ensure required columns exist
+    for col in FEATURE_COLUMNS:
+        if col not in df.columns:
+            df[col] = np.nan
+    for sc in ["LATITUDE", "LONGITUDE", "ELEVATION"]:
+        if sc not in df.columns:
+            df[sc] = np.nan
 
-    ckpt: Dict = torch.load(ckpt_path, map_location="cpu")
+    # Clean numerics (placeholders -> NaN -> numeric)
+    def _clean_numeric(col):
+        s = df[col].astype(str).str.strip()
+        s = s.replace(list(PLACEHOLDER_STRINGS), np.nan)
+        s = pd.to_numeric(s, errors="coerce")
+        return s
 
-    # --------- infer architecture from filename or ckpt -------------
-    if "LSTM" in ckpt_path.stem.upper():
-        arch = "LSTM"
-    elif "TCN" in ckpt_path.stem.upper():
-        arch = "TCN"
-    elif "CNN" in ckpt_path.stem.upper():
-        arch = "CNN"
-    elif "GRU" in ckpt_path.stem.upper():
-        arch = "GRU"
-    else:
-        arch = ckpt.get("arch", "LSTM")   # fallback
+    for col in FEATURE_COLUMNS + ["LATITUDE", "LONGITUDE", "ELEVATION"]:
+        df[col] = _clean_numeric(col)
 
-    ArchClass = _get_arch_class(arch)
-    model = ArchClass(num_features=len(FEATURE_COLUMNS))
+    # Impute per-feature mean (after removal)
+    for col in FEATURE_COLUMNS:
+        mean_val = df[col].mean(skipna=True)
+        if pd.isna(mean_val):
+            mean_val = 0.0
+        df[col] = df[col].fillna(mean_val)
+
+    # Station statics (first non-NaN, else 0)
+    for sc in ["LATITUDE", "LONGITUDE", "ELEVATION"]:
+        val = df[sc].dropna().iloc[0] if df[sc].notna().any() else 0.0
+        df[sc] = float(val)
+
+    return df
+
+class GSODForecastDataset(Dataset):
+    """
+    90-day history -> 15-day future.
+    Uses provided mins/maxs for scaling.
+    """
+    def __init__(self, station_dfs, mins, maxs, window_in=90, window_out=15):
+        self.samples = []
+        self.mins = np.asarray(mins, dtype=np.float32)
+        self.maxs = np.asarray(maxs, dtype=np.float32)
+        self.ranges = (self.maxs - self.mins).astype(np.float32)
+        self.ranges[self.ranges == 0] = 1.0
+        self.window_in = window_in
+        self.window_out = window_out
+
+        for df in station_dfs:
+            feats = df[FEATURE_COLUMNS].astype(float).values  # (N,7)
+            dates = pd.to_datetime(df["DATE"]).dt.date.values
+            lat = float(df["LATITUDE"].iloc[0])
+            lon = float(df["LONGITUDE"].iloc[0])
+            elev = float(df["ELEVATION"].iloc[0])
+
+            N = len(df)
+            for i in range(window_in, N - window_out + 1):
+                hist = feats[i - window_in:i, :]           # (90,7)
+                fut = feats[i:i + window_out, :]           # (15,7)
+                month = pd.Timestamp(dates[i]).month
+
+                hist_s = (hist - self.mins) / self.ranges
+                fut_s  = (fut  - self.mins) / self.ranges
+                x_static = np.array([month, lat, lon, elev], dtype=np.float32)
+
+                flat = np.concatenate([hist_s.reshape(-1), x_static], axis=0).astype(np.float32)
+
+                self.samples.append((
+                    hist_s.astype(np.float32),
+                    x_static,
+                    flat,
+                    fut_s.astype(np.float32),
+                    fut.astype(np.float32)   # keep real units for convenience (optional)
+                ))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        h, s, f, y_s, y_real = self.samples[idx]
+        return {
+            "hist": torch.from_numpy(h),          # (90,7) scaled
+            "static": torch.from_numpy(s),        # (4,)
+            "flat": torch.from_numpy(f),          # (90*7+4,)
+            "target": torch.from_numpy(y_s),      # (15,7) scaled
+            "target_real": torch.from_numpy(y_real), # (15,7) real units
+        }
+
+# ============== Metrics ==============
+
+def mae(a, b):
+    return np.mean(np.abs(a - b))
+
+def rmse(a, b):
+    return float(np.sqrt(np.mean((a - b) ** 2)))
+
+def skill_score(y_true, y_pred):
+    """
+    Nash–Sutcliffe / R^2-like skill: 1 - MSE/Var(y_true)
+    Returns 0 if variance is ~0 to avoid div-by-zero.
+    """
+    mse = np.mean((y_true - y_pred) ** 2)
+    var = np.var(y_true)
+    if var < 1e-12:
+        return 0.0
+    return 1.0 - (mse / var)
+
+# ============== Main ==============
+
+def _read_ids(path):
+    with open(path, "r") as f:
+        return [ln.strip() for ln in f if ln.strip()]
+
+def _find_latest_model(model_dir, abbrev):
+    files = glob(os.path.join(model_dir, "*.pt"))
+    cand = []
+    prefix = abbrev.lower()
+    for f in files:
+        base = os.path.basename(f)
+        if base.lower().startswith(prefix + "_"):
+            cand.append((os.path.getmtime(f), f))
+    if not cand:
+        return None
+    cand.sort(key=lambda x: x[0], reverse=True)
+    return cand[0][1]
+
+def _import_trainer_module(abbrev):
+    # Try exact, lower, and upper variants: {abbrev}_train
+    names = [
+        f"{abbrev}_train",
+        f"{abbrev.lower()}_train",
+        f"{abbrev.upper()}_train",
+    ]
+    last_err = None
+    for n in names:
+        try:
+            return importlib.import_module(n)
+        except ModuleNotFoundError as e:
+            last_err = e
+    raise last_err
+
+def main():
+    parser = argparse.ArgumentParser(description="Evaluate a trained weather forecast model")
+    parser.add_argument("--modelAbbrev", type=str, required=True, help='e.g., "LSTM" (expects LSTM_train.py)')
+    parser.add_argument("--dataRoot", type=str, default=".\\NOAA_GSOD")
+    parser.add_argument("--testList", type=str, default=".\\listToTest.txt")
+    parser.add_argument("--modelDir", type=str, default=".\\model")
+    parser.add_argument("--evalDir", type=str, default=".\\eval")
+    parser.add_argument("--batchSize", type=int, default=256)
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    args = parser.parse_args()
+
+    os.makedirs(args.evalDir, exist_ok=True)
+
+    # ---- Locate checkpoint
+    ckpt_path = _find_latest_model(args.modelDir, args.modelAbbrev)
+    if ckpt_path is None:
+        print(f"No checkpoint found in {args.modelDir} for prefix '{args.modelAbbrev}_*'.")
+        sys.exit(1)
+
+    print(f"Using checkpoint: {ckpt_path}")
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    config = ckpt.get("config", {})
+    mins = np.array(config["scaling"]["mins"], dtype=np.float32)
+    maxs = np.array(config["scaling"]["maxs"], dtype=np.float32)
+    ranges = (maxs - mins).astype(np.float32)
+    ranges[ranges == 0] = 1.0
+
+    # ---- Import trainer module and build model
+    trainer = _import_trainer_module(args.modelAbbrev)
+    if not hasattr(trainer, "create_model"):
+        print(f"ERROR: {trainer.__name__} must expose create_model(config) -> nn.Module")
+        sys.exit(1)
+
+    model = trainer.create_model(config)
     model.load_state_dict(ckpt["model_state_dict"])
-    model.to(device).eval()
+    device = torch.device(args.device)
+    model.to(device)
+    model.eval()
 
-    mu  = ckpt["mu"].to(device)          # (F,)
-    std = ckpt["std"].to(device)
+    # ---- Load test stations
+    test_ids = _read_ids(args.testList)
+    print("Stations for TEST/VAL:")
+    for s in test_ids:
+        print("  ", s)
 
-    # -------------------- build test dataset ------------------------
-    station_ids = [ln.strip() for ln in args.list_file.read_text().splitlines() if ln]
-    df_test = _load_test_stations(DATA_DIR, station_ids)
-    dataset = WeatherDataset(df_test)
-    loader  = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
+    # ---- Load dataframes
+    def _load_many(ids):
+        dfs = []
+        for sid in ids:
+            df = _read_station_dataframe(args.dataRoot, sid)
+            if df is None or len(df) < 120:
+                print(f"Skipping {sid} (no data / too short).")
+                continue
+            dfs.append(df)
+        return dfs
 
-    tracker = MetricTracker(num_feat=len(FEATURE_COLUMNS), horizons=(0, 6, 14))
+    test_dfs = _load_many(test_ids)
+    if not test_dfs:
+        print("No valid test data found.")
+        sys.exit(1)
+
+    # ---- Dataset / Loader (scale with train mins/maxs from checkpoint)
+    test_ds = GSODForecastDataset(test_dfs, mins, maxs)
+    test_loader = DataLoader(test_ds, batch_size=args.batchSize, shuffle=False, num_workers=0, pin_memory=True)
+
+    # ---- Inference (collect predictions & truths in REAL units)
+    preds_real = []
+    trues_real = []
 
     with torch.no_grad():
-        for X_raw, y_raw in tqdm(loader, desc="Evaluating"):
-            X_raw = X_raw.to(device)    # (B,F,90)
-            y_raw = y_raw.to(device)    # (B,F,15)
+        for batch in tqdm(test_loader, desc="Evaluating", leave=False):
+            xh = batch["hist"].to(device)        # scaled
+            xs = batch["static"].to(device)
+            y_s = batch["target"].to(device)     # scaled
+            y_real = batch["target_real"].numpy()  # already real units from dataset
 
-            # --- standardise inputs ---
-            X_std = (X_raw - mu[:, None]) / (std[:, None] + 1e-8)
-            pred_std = model(X_std)          # (B,F,15) in z-space
-            pred_raw = pred_std * (std[:, None] + 1e-8) + mu[:, None]
+            yhat_s = model(xh, xs).cpu().numpy()  # scaled predictions
+            # inverse transform to real units: y = s*(max-min)+min (per-feature)
+            yhat_real = yhat_s * ranges.reshape(1, 1, -1) + mins.reshape(1, 1, -1)
 
-            # baseline = persistence (repeat last obs)
-            baseline = X_raw[:, :, -1:].repeat(1, 1, OUTPUT_SEQ_LEN)
+            preds_real.append(yhat_real)
+            trues_real.append(y_real)
 
-            tracker.update(y_raw, pred_raw, baseline)
+    y_pred = np.concatenate(preds_real, axis=0)  # (N, 15, 7)
+    y_true = np.concatenate(trues_real, axis=0)  # (N, 15, 7)
 
-    df = tracker.summary()
-    print("\nPer-feature metrics at key horizons\n")
-    print(df.to_string(float_format=lambda x: f"{x:8.4f}"))
+    # ---- Metrics per requested horizons: Day 1, 7, 15
+    horizon_map = {1: 0, 7: 6, 15: 14}
+    rows = []
+    for day, idx in horizon_map.items():
+        for fi, feat in enumerate(FEATURE_COLUMNS):
+            y_t = y_true[:, idx, fi]
+            y_p = y_pred[:, idx, fi]
+            m_mae = float(mae(y_t, y_p))
+            m_rmse = rmse(y_t, y_p)
+            m_skill = float(skill_score(y_t, y_p))
+            rows.append({"Horizon": f"Day {day}", "Feature": feat, "MAE": m_mae, "RMSE": m_rmse, "Skill": m_skill})
+
+    df_out = pd.DataFrame(rows, columns=["Horizon", "Feature", "MAE", "RMSE", "Skill"])
+
+    # ---- Save CSV
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    out_path = os.path.join(args.evalDir, f"{args.modelAbbrev}_{timestamp}.csv")
+    df_out.to_csv(out_path, index=False)
+    print(f"\nSaved evaluation to: {out_path}")
 
 if __name__ == "__main__":
     main()

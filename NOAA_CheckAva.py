@@ -27,7 +27,7 @@ def main():
     os.makedirs('NOAA_GSOD', exist_ok=True)
     
     # Years to compare
-    target_years = [2000, 2009, 2018]
+    target_years = [2000,2002,2005, 2007, 2009, 2011, 2013, 2016, 2018, 2020, 2023, 2024]
     station_sets = {}
     
     # Get stations for each target year
